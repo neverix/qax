@@ -11,7 +11,7 @@ packages = [
 
 [tool.poetry.dependencies]
 python = '^3.10'
-jax = '^0.4.24'
+jax = '>=0.4.24'
 jaxlib = '^0.4.24'
 plum-dispatch = '^2.1.0'
 optax = '^0.1.5'
