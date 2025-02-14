@@ -15,6 +15,7 @@ from jax import core
 from jax._src.typing import DTypeLike, Shape
 from jax.api_util import flatten_fun, flatten_fun_nokwargs
 from jax.tree_util import register_pytree_with_keys_class
+from jax._src import source_info_util
 
 from .. import constants
 from ..primitives import ArrayValue, get_primitive_handler
@@ -22,29 +23,33 @@ from . import implicit_utils as iu
 
 
 def _with_implicit_flat(fun: lu.WrappedFun) -> lu.WrappedFun:
-    # Splitting to avoid leaks based on https://github.com/google/jax/blob/0dffdf4645db7bf7a9fadd4bcfe9ec0368a8ecb9/jax/_src/interpreters/batching.py#L539
+    # Splitting to avoid leaks based on https://github.com/jax-ml/jax/blob/4b94665f4f1ad32610a8126a6bf939704195238b/jax/_src/interpreters/batching.py#L593
     f = _implicit_inner(fun)
     return _implicit_outer(f)
 
 
-@lu.transformation
-def _implicit_outer(*in_vals):
-    with core.new_main(ImplicitArrayTrace) as main:
-        outs = yield (main, *in_vals), {}
-        del main
+@lu.transformation2
+def _implicit_outer(f, *in_vals):
+    tag = core.TraceTag()
+    with source_info_util.transform_name_stack('qax'):
+        outs, trace = f(tag, *in_vals)
+    with core.ensure_no_leaks(trace): del trace
     yield outs
 
 
-@lu.transformation
-def _implicit_inner(main, *in_vals):
-    trace = main.with_cur_sublevel()
-    in_tracers = [
-        ImplicitArrayTracer(trace, val) if isinstance(val, ImplicitArray) else val
-        for val in in_vals
-    ]
-    outs = yield in_tracers, {}
+@lu.transformation2
+def _implicit_inner(f, tag, *in_vals):
+    with core.take_current_trace() as parent_trace:
+        trace = ImplicitArrayTrace(parent_trace, tag)
+        in_tracers = [
+            # ImplicitArrayTracer(trace, val) if isinstance(val, ImplicitArray) else val
+            ImplicitArrayTracer(val) if isinstance(val, ImplicitArray) else val
+            for val in in_vals
+        ]
+        with core.set_current_trace(trace):
+            outs = f(*in_tracers)
     out_vals = [trace.full_raise(t).value for t in outs]
-    yield out_vals
+    yield out_vals, trace
 
 
 def use_implicit_args(f):
@@ -60,7 +65,8 @@ def use_implicit_args(f):
         f_flat, out_tree = flatten_fun(lu.wrap_init(f), in_tree)
         f_wrapped = _with_implicit_flat(f_flat)
         outs_flat = f_wrapped.call_wrapped(*flat_args)
-        return out_tree().unflatten(outs_flat)
+        with jax.debug_nans(False):
+            return out_tree().unflatten(outs_flat)
 
     return implicit_f
 
@@ -312,7 +318,8 @@ class ImplicitArrayTrace(core.Trace):
 
     def process_primitive(self, primitive, tracers, params):
         outs = NotImplemented
-        vals = [t.value for t in tracers]
+        vals = [t.value if isinstance(t, ImplicitArrayTracer) else t for t in tracers]
+        # vals = [t.value for t in tracers]
         implicit_idx = next(
             (i for i, v in enumerate(vals) if isinstance(v, ImplicitArray)), None
         )
